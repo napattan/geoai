@@ -1173,11 +1173,12 @@ def _merge_tiles(
                 dtype=t_data.dtype,
                 crs=merge_crs,
                 transform=t_transform,
+                nodata=-128,
             )
             ds.write(t_data)
             mem_datasets.append(ds)
 
-        mosaic, mosaic_transform = rasterio_merge(mem_datasets)
+        mosaic, mosaic_transform = rasterio_merge(mem_datasets, nodata=-128)
         mosaic_bounds = array_bounds(mosaic.shape[1], mosaic.shape[2], mosaic_transform)
     finally:
         for ds in mem_datasets:
@@ -1495,6 +1496,7 @@ def download_google_satellite_embedding(
                 resolution=resolution,
             )
 
+            nodata_val = np.nan if dequantize else -128
             dst_mosaic = np.empty((out_bands, dst_height, dst_width), dtype=out_dtype)
 
             reproject(
@@ -1504,6 +1506,8 @@ def download_google_satellite_embedding(
                 src_crs=merge_crs,
                 dst_transform=dst_transform,
                 dst_crs=crs,
+                src_nodata=nodata_val,
+                dst_nodata=nodata_val,
                 resampling=Resampling.nearest,
             )
             mosaic = dst_mosaic

@@ -16,6 +16,7 @@ Reference:
 """
 
 import logging
+import math
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -599,15 +600,20 @@ def tessera_sample_points(
         point_lat = row.geometry.y
 
         # Find the tile containing this point
-        tile_lon = round(round(point_lon / 0.1) * 0.1 + 0.05, 2)
-        tile_lat = round(round(point_lat / 0.1) * 0.1 + 0.05, 2)
+        lon_idx = math.floor(round(point_lon * 10.0, 9))
+        lat_idx = math.floor(round(point_lat * 10.0, 9))
+        tile_lon = round(lon_idx * 0.1 + 0.05, 2)
+        tile_lat = round(lat_idx * 0.1 + 0.05, 2)
 
         tile = tile_data.get((tile_lon, tile_lat))
         if tile is None:
             # Try nearby tiles
             found = False
             for (tlon, tlat), tdata in tile_data.items():
-                if abs(tlon - point_lon) <= 0.1 and abs(tlat - point_lat) <= 0.1:
+                if (
+                    abs(tlon - point_lon) <= 0.05 + 1e-9
+                    and abs(tlat - point_lat) <= 0.05 + 1e-9
+                ):
                     tile = tdata
                     found = True
                     break
@@ -628,7 +634,7 @@ def tessera_sample_points(
             else:
                 px_x, px_y = ~tile["transform"] * (point_lon, point_lat)
 
-            px_x, px_y = int(px_x), int(px_y)
+            px_x, px_y = math.floor(px_x), math.floor(px_y)
             h, w = tile["embedding"].shape[:2]
 
             if 0 <= px_x < w and 0 <= px_y < h:

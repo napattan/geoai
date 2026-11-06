@@ -16,6 +16,7 @@ import scipy.ndimage as ndimage
 import torch
 from huggingface_hub import hf_hub_download
 from rasterio.windows import Window
+import shapely
 from shapely.geometry import Polygon, box
 from torchvision.models.detection import (
     fasterrcnn_resnet50_fpn_v2,
@@ -563,22 +564,28 @@ class ObjectDetector:
         )
 
         keep_indices = []
-        polygons = gdf.geometry.values
+        keep_set = set()
+        polygons = np.asarray(gdf.geometry.values)
+        areas = shapely.area(polygons)
+        valid_flags = shapely.is_valid(polygons)
+        tree = shapely.STRtree(polygons)
 
         for i in range(len(polygons)):
-            if i in keep_indices:
+            if not valid_flags[i]:
+                keep_indices.append(i)
+                keep_set.add(i)
                 continue
 
             keep = True
-            for j in keep_indices:
-                # Skip invalid geometries
-                if not polygons[i].is_valid or not polygons[j].is_valid:
+            for j in tree.query(polygons[i], predicate="intersects"):
+                j = int(j)
+                if j >= i or j not in keep_set or not valid_flags[j]:
                     continue
 
                 # Calculate IoU
                 try:
                     intersection = polygons[i].intersection(polygons[j]).area
-                    union = polygons[i].area + polygons[j].area - intersection
+                    union = areas[i] + areas[j] - intersection
                     iou = intersection / union if union > 0 else 0
 
                     if iou > iou_threshold:
@@ -590,6 +597,7 @@ class ObjectDetector:
 
             if keep:
                 keep_indices.append(i)
+                keep_set.add(i)
 
         return gdf.iloc[keep_indices]
 
@@ -647,12 +655,11 @@ class ObjectDetector:
             filtered_gdf = gdf[gdf.intersects(inner_box)]
 
             # Additional check for objects that have >50% of their area outside the valid region
-            valid_objects = []
-            for idx, row in filtered_gdf.iterrows():
-                if row.geometry.intersection(inner_box).area >= 0.5 * row.geometry.area:
-                    valid_objects.append(idx)
-
-            filtered_gdf = filtered_gdf.loc[valid_objects]
+            keep_mask = filtered_gdf.within(inner_box) | (
+                filtered_gdf.geometry.intersection(inner_box).area
+                >= 0.5 * filtered_gdf.geometry.area
+            )
+            filtered_gdf = filtered_gdf.loc[keep_mask]
 
             logger.info(f"Objects after filtering: {len(filtered_gdf)}")
 
@@ -773,11 +780,18 @@ class ObjectDetector:
                     continue
 
                 # Create a mask for this object
-                object_mask = (labels == i).astype(np.uint8)
+                x0 = int(stats[i, cv2.CC_STAT_LEFT])
+                y0 = int(stats[i, cv2.CC_STAT_TOP])
+                x1 = x0 + int(stats[i, cv2.CC_STAT_WIDTH])
+                y1 = y0 + int(stats[i, cv2.CC_STAT_HEIGHT])
+                object_mask = (labels[y0:y1, x0:x1] == i).astype(np.uint8)
 
                 # Find contours
                 contours, _ = cv2.findContours(
-                    object_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    object_mask,
+                    cv2.RETR_EXTERNAL,
+                    cv2.CHAIN_APPROX_SIMPLE,
+                    offset=(x0, y0),
                 )
 
                 # Process each contour
@@ -2246,6 +2260,7 @@ class ObjectDetector:
             confidence_threshold: float,
             min_object_area: int,
             max_object_area: Optional[int],
+            offset: Tuple[int, int] = (0, 0),
         ) -> Optional[Dict[str, Any]]:
             # Get confidence value
             conf_region = conf_data[component_mask > 0]
@@ -2260,7 +2275,10 @@ class ObjectDetector:
 
             # Find contours
             contours, _ = cv2.findContours(
-                component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                component_mask,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+                offset=offset,
             )
 
             results = []
@@ -2294,31 +2312,42 @@ class ObjectDetector:
         from functools import partial
 
         def process_component(
-            args: Tuple[int, np.ndarray, np.ndarray, Any, float, int, Optional[int]],
+            args: Tuple[
+                int,
+                np.ndarray,
+                np.ndarray,
+                Any,
+                float,
+                int,
+                Optional[int],
+                Tuple[int, int],
+            ],
         ) -> Optional[Dict[str, Any]]:
             """
             Helper function to process a single component
             """
             (
                 label,
-                labeled_mask,
-                conf_data,
+                labeled_slice,
+                conf_slice,
                 transform,
                 confidence_threshold,
                 min_object_area,
                 max_object_area,
+                offset,
             ) = args
 
-            # Create mask for this component
-            component_mask = (labeled_mask == label).astype(np.uint8)
+            # Create mask for this component within its bounding slice
+            component_mask = (labeled_slice == label).astype(np.uint8)
 
             return _process_single_component(
                 component_mask,
-                conf_data,
+                conf_slice,
                 transform,
                 confidence_threshold,
                 min_object_area,
                 max_object_area,
+                offset=offset,
             )
 
         start_time = time.time()
@@ -2337,8 +2366,9 @@ class ObjectDetector:
             # Convert to binary mask
             binary_mask = mask_data > 0
 
-            # Find connected components
+            # Find connected components and bounding slices
             labeled_mask, num_features = ndimage.label(binary_mask)
+            slices = ndimage.find_objects(labeled_mask)
             logger.info(f"Found {num_features} connected components")
 
             # Process each component
@@ -2354,16 +2384,21 @@ class ObjectDetector:
                 for label in tqdm(
                     range(1, num_features + 1), desc="Processing components"
                 ):
-                    # Create mask for this component
-                    component_mask = (labeled_mask == label).astype(np.uint8)
+                    slc = slices[label - 1]
+                    if slc is None:
+                        continue
+                    offset = (int(slc[1].start), int(slc[0].start))
+                    sub_lbl = labeled_mask[slc]
+                    component_mask = (sub_lbl == label).astype(np.uint8)
 
                     result = _process_single_component(
                         component_mask,
-                        conf_data,
+                        conf_data[slc],
                         transform,
                         confidence_threshold,
                         min_object_area,
                         max_object_area,
+                        offset=offset,
                     )
 
                     if result:
@@ -2380,14 +2415,16 @@ class ObjectDetector:
                 process_args = [
                     (
                         label,
-                        labeled_mask,
-                        conf_data,
+                        labeled_mask[slc],
+                        conf_data[slc],
                         transform,
                         confidence_threshold,
                         min_object_area,
                         max_object_area,
+                        (int(slc[1].start), int(slc[0].start)),
                     )
-                    for label in range(1, num_features + 1)
+                    for label, slc in enumerate(slices, start=1)
+                    if slc is not None
                 ]
 
                 with concurrent.futures.ThreadPoolExecutor(

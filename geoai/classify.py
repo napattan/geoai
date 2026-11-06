@@ -115,6 +115,7 @@ def train_classifier(
     Returns:
         object: Trained SemanticSegmentationTask model.
     """
+    import inspect
     import multiprocessing as mp
     import timeit
 
@@ -125,7 +126,11 @@ def train_classifier(
     from lightning.pytorch.loggers import CSVLogger
     from torch.utils.data import DataLoader
     from torchgeo.datamodules import GeoDataModule
-    from torchgeo.datasets import RasterDataset, stack_samples
+    from torchgeo.datasets import (
+        IntersectionDataset,
+        RasterDataset,
+        stack_samples,
+    )
     from torchgeo.datasets.splits import random_bbox_assignment
     from torchgeo.samplers import (
         GridGeoSampler,
@@ -146,18 +151,24 @@ def train_classifier(
 
             image = sample["image"]
             mask = sample["mask"]
+            orig_dim = mask.dim()
+            orig_dtype = mask.dtype
 
             # Albumentations expects channels last, but TorchGeo uses channels first
             # Convert (C, H, W) to (H, W, C) for image
             image_np = image.permute(1, 2, 0).numpy()
-            mask_np = mask.squeeze(0).numpy() if mask.dim() > 2 else mask.numpy()
+            mask_np = mask.squeeze(0).numpy() if orig_dim > 2 else mask.numpy()
 
             # Apply transformation with named arguments
-            transformed = self.transform(image=image_np, mask=mask_np)
+            mask_int32 = mask_np.astype(np.int32)
+            transformed = self.transform(image=image_np, mask=mask_int32)
 
             # Convert back to PyTorch tensors with channels first
             transformed_image = torch.from_numpy(transformed["image"]).permute(2, 0, 1)
-            transformed_mask = torch.from_numpy(transformed["mask"]).unsqueeze(0)
+            raw_mask = torch.from_numpy(transformed["mask"])
+            transformed_mask = raw_mask.to(orig_dtype)
+            if orig_dim > 2:
+                transformed_mask = transformed_mask.unsqueeze(0)
 
             # Update the sample dictionary
             result = sample.copy()
@@ -168,6 +179,18 @@ def train_classifier(
 
     # Set up data augmentation if requested
     if use_augmentation:
+        cd_sig = inspect.signature(A.CoarseDropout.__init__)
+        if "num_holes_range" in cd_sig.parameters:
+            coarse_dropout = A.CoarseDropout(
+                p=0.3,
+                num_holes_range=(1, 8),
+                hole_height_range=(8, 32),
+                hole_width_range=(8, 32),
+            )
+        else:
+            coarse_dropout = A.CoarseDropout(
+                p=0.3, max_holes=8, max_height=32, max_width=32
+            )
         aug_transforms = A.Compose(
             [
                 A.HorizontalFlip(p=0.5),
@@ -181,7 +204,7 @@ def train_classifier(
                 ),
                 A.GaussianBlur(p=0.3),
                 A.GaussNoise(p=0.3),
-                A.CoarseDropout(p=0.3, max_holes=8, max_height=32, max_width=32),
+                coarse_dropout,
             ]
         )
         # Wrap the albumentations transforms
@@ -216,6 +239,7 @@ def train_classifier(
     if logger is None:
         logger = CSVLogger(test_dir, name="lightning_logs")
 
+    checkpoint_callback = None
     if callbacks is None:
         checkpoint_callback = ModelCheckpoint(
             dirpath=test_dir,
@@ -263,7 +287,7 @@ def train_classifier(
     if isinstance(image_root, RasterDataset):
         images = image_root
     else:
-        images = ImageDatasetClass(paths=image_root, transforms=transforms, **kwargs)
+        images = ImageDatasetClass(paths=image_root, **kwargs)
 
     if isinstance(label_root, RasterDataset):
         labels = label_root
@@ -271,7 +295,7 @@ def train_classifier(
         labels = LabelDatasetClass(paths=label_root, **kwargs)
 
     # Create intersection dataset
-    dataset = images & labels
+    dataset = IntersectionDataset(images, labels, transforms=transforms)
 
     # Define custom datamodule for training
     class CustomGeoDataModule(GeoDataModule):
@@ -281,14 +305,28 @@ def train_classifier(
             Args:
                 stage: Either 'fit', 'validate', 'test', or 'predict'.
             """
-            self.dataset = self.dataset_class(**self.kwargs)
+            dataset1 = self.kwargs.get("dataset1", images)
+            dataset2 = self.kwargs.get("dataset2", labels)
+            ds_transforms = getattr(
+                self,
+                "transforms",
+                self.kwargs.get("transforms", transforms),
+            )
+            self.dataset = IntersectionDataset(
+                dataset1,
+                dataset2,
+                transforms=ds_transforms,
+            )
 
             generator = torch.Generator().manual_seed(seed)
+            split_datasets = random_bbox_assignment(
+                self.dataset, train_val_test_split, generator
+            )
             (
                 self.train_dataset,
                 self.val_dataset,
                 self.test_dataset,
-            ) = random_bbox_assignment(dataset, train_val_test_split, generator)
+            ) = split_datasets
 
             if stage in ["fit"]:
                 self.train_batch_sampler = RandomBatchGeoSampler(
@@ -312,6 +350,7 @@ def train_classifier(
         num_workers=workers,
         dataset1=images,
         dataset2=labels,
+        transforms=transforms,
         collate_fn=stack_samples,
     )
 
@@ -337,7 +376,11 @@ def train_classifier(
     training_time = timeit.default_timer() - start
     _logger.info("The time taken to train was: %.2f seconds", training_time)
 
-    best_model_path = checkpoint_callback.best_model_path
+    best_model_path = (
+        checkpoint_callback.best_model_path
+        if checkpoint_callback is not None
+        else ""
+    )
     _logger.info("Best model saved at: %s", best_model_path)
 
     # Test the model
